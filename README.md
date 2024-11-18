@@ -58,7 +58,173 @@ function test_POC_swapIn_whenTokenInIsToken_shouldSwapIn() public {
 
 The specific mitigation depends on the design.
 
-# Issue M-2: `TradingLimits::update()` incorrectly only rounds up when `deltaFlowUnits` becomes 0, which will silently increase trading limits 
+# Issue M-2: `GoodDollarExchangeProvider::mintFromExpansion()` will change the price due to a rounding error in the new ratio 
+
+Source: https://github.com/sherlock-audit/2024-10-mento-update-judging/issues/21 
+
+## Found by 
+0x73696d616f
+### Summary
+
+[GoodDollarExchangeProvider::mintFromExpansion()](https://github.com/sherlock-audit/2024-10-mento-update/blob/main/mento-core/contracts/goodDollar/GoodDollarExchangeProvider.sol#L147) mints supply tokens while keeping the current price constant. To achieve this, a certain formula is used, but in the process it scales the `reserveRatioScalar * exchange.reserveRatio` to `1e8` precision (the precision of `exchange.reserveRatio`) down from `1e18`. 
+
+However, the calculation of the new amount of tokens to mint is based on the full ratio with 1e18, which will mint more tokens than it should and change the price, breaking the readme.
+
+Note1: there is also a slight price change in [GoodDollarExchangeProvider::mintFromInterest()](https://github.com/sherlock-audit/2024-10-mento-update/blob/main/mento-core/contracts/goodDollar/GoodDollarExchangeProvider.sol#L179-L181) due to using `mul` and then `div`, as `mul` divides by `1e18` unnecessarily in this case.
+
+Note2: [GoodDollarExchangeProvider::updateRatioForReward()](https://github.com/sherlock-audit/2024-10-mento-update/blob/main/mento-core/contracts/goodDollar/GoodDollarExchangeProvider.sol#L205) also has precision loss as it calculates the ratio using the formula and then scales it down, changing the price.
+
+### Root Cause
+
+In `GoodDollarExchangeProvider:147`, `newRatio` is calculated with full `1e18` precision and used to calculate the amount of tokens to mint, but `exchanges[exchangeId].reserveRatio` is stored with the downscaled value, `newRatio / 1e10`, causing an error and price change. 
+
+This happens because the price is `reserve / (supply * reserveRatio)`. As `supply` is increased by a calculation that uses the full precision `newRatio`, but `reserveRatio` is stored with less precision (`1e8`), the price will change due to this call.
+
+### Internal pre-conditions
+
+None.
+
+### External pre-conditions
+
+None.
+
+### Attack Path
+
+1. `GoodDollarExchangeProvider::mintFromExpansion()` is called and a rounding error happens in the calculation of `newRatio`.
+
+### Impact
+
+The current price is modified due to the expansion which goes against the readme:
+> What properties/invariants do you want to hold even if breaking them has a low/unknown impact?
+
+> Bancor formula invariant. Price = Reserve / Supply * reserveRatio
+
+### PoC
+
+Add the following test to `GoodDollarExchangeProvider.t.sol`:
+```solidity
+function test_POC_mintFromExpansion_priceChangeFix() public {
+  uint256 priceBefore = exchangeProvider.currentPrice(exchangeId);
+  vm.prank(expansionControllerAddress);
+  exchangeProvider.mintFromExpansion(exchangeId, reserveRatioScalar);
+  uint256 priceAfter = exchangeProvider.currentPrice(exchangeId);
+  assertEq(priceBefore, priceAfter, "Price should remain exactly equal");
+}
+```
+If the code is used as is, it fails. but if it is fixed by dividing and multiplying by `1e10`, eliminating the rounding error, the price matches exactly (exact fix show below).
+
+### Mitigation
+
+Divide and multiply `newRatio` by `1e10` to eliminate the rounding error, keeping the price unchanged.
+```solidity
+function mintFromExpansion(
+  bytes32 exchangeId,
+  uint256 reserveRatioScalar
+) external onlyExpansionController whenNotPaused returns (uint256 amountToMint) {
+  require(reserveRatioScalar > 0, "Reserve ratio scalar must be greater than 0");
+  PoolExchange memory exchange = getPoolExchange(exchangeId);
+
+  UD60x18 scaledRatio = wrap(uint256(exchange.reserveRatio) * 1e10);
+  UD60x18 newRatio = wrap(unwrap(scaledRatio.mul(wrap(reserveRatioScalar))) / 1e10 * 1e10);
+  ...
+}
+```
+
+# Issue M-3: Malicious user may frontrun `GoodDollarExpansionController::mintUBIFromReserveBalance()` to make protocol funds stuck 
+
+Source: https://github.com/sherlock-audit/2024-10-mento-update-judging/issues/33 
+
+## Found by 
+0x73696d616f
+### Summary
+
+[GoodDollarExpansionController::mintUBIFromReserveBalance()](https://github.com/sherlock-audit/2024-10-mento-update/blob/main/mento-core/contracts/goodDollar/GoodDollarExpansionController.sol#L153) or [GoodDollarExpansionController::mintUBIFromInterest()](https://github.com/sherlock-audit/2024-10-mento-update/blob/main/mento-core/contracts/goodDollar/GoodDollarExpansionController.sol#L137) transfer funds to the reserve and mint $G to the distribution helper. However,  [GoodDollarExchangeProvider::mintFromInterest()](https://github.com/sherlock-audit/2024-10-mento-update/blob/main/mento-core/contracts/goodDollar/GoodDollarExpansionController.sol#L142) [mints 0 tokens](https://github.com/sherlock-audit/2024-10-mento-update/blob/main/mento-core/contracts/goodDollar/GoodDollarExchangeProvider.sol#L179-L181) whenever the supply is 0. An attacker can buy all $G from the exchange to trigger this.
+
+### Root Cause
+
+In `GoodDollarExpansionController::142` and `GoodDollarExpansionController::161`, `amountMinted` is not checked for a null value.
+
+### Internal pre-conditions
+
+None.
+
+### External pre-conditions
+
+None.
+
+### Attack Path
+
+1. Attacker calls `Bancor::swapIn()` or `Bancor::swapOut()`, buying all $G in the exchange, making `PoolExchange.tokenSupply` null.
+2. `GoodDollarExpansionController::mintUBIFromReserveBalance()` or `GoodDollarExpansionController::mintUBIFromInterest()` is called, adding reserve asset funds without minting $G.
+
+### Impact
+
+Funds are added to the reserve without the corresponding amount of $G being minted.
+
+### PoC
+
+`GoodDollarExpansionController::mintUBIFromInterest()` and `GoodDollarExpansionController::mintUBIFromReserveBalance()` do not check if `amountToMint` is null:
+```solidity
+function mintUBIFromInterest(bytes32 exchangeId, uint256 reserveInterest) external {
+  require(reserveInterest > 0, "Reserve interest must be greater than 0");
+  IBancorExchangeProvider.PoolExchange memory exchange = IBancorExchangeProvider(address(goodDollarExchangeProvider))
+    .getPoolExchange(exchangeId);
+
+  uint256 amountToMint = goodDollarExchangeProvider.mintFromInterest(exchangeId, reserveInterest);
+
+  require(IERC20(exchange.reserveAsset).transferFrom(msg.sender, reserve, reserveInterest), "Transfer failed"); //@audit safeTransferFrom.  //@audit lost if reserve asset is also a stable asset
+  IGoodDollar(exchange.tokenAddress).mint(address(distributionHelper), amountToMint);
+
+  // Ignored, because contracts only interacts with trusted contracts and tokens
+  // slither-disable-next-line reentrancy-events
+  emit InterestUBIMinted(exchangeId, amountToMint);
+}
+
+...
+
+function mintUBIFromReserveBalance(bytes32 exchangeId) external returns (uint256 amountMinted) {
+  IBancorExchangeProvider.PoolExchange memory exchange = IBancorExchangeProvider(address(goodDollarExchangeProvider))
+    .getPoolExchange(exchangeId);
+
+  uint256 contractReserveBalance = IERC20(exchange.reserveAsset).balanceOf(reserve);
+  uint256 additionalReserveBalance = contractReserveBalance - exchange.reserveBalance;
+  if (additionalReserveBalance > 0) {
+    amountMinted = goodDollarExchangeProvider.mintFromInterest(exchangeId, additionalReserveBalance);
+    IGoodDollar(exchange.tokenAddress).mint(address(distributionHelper), amountMinted);
+
+    // Ignored, because contracts only interacts with trusted contracts and tokens
+    // slither-disable-next-line reentrancy-events
+    emit InterestUBIMinted(exchangeId, amountMinted);
+  }
+}
+```
+
+`GoodDollarExchangeProvider::mintFromInterest()` returns 0 if `exchange.tokenSupply` is 0.
+```solidity
+function mintFromInterest(
+  bytes32 exchangeId,
+  uint256 reserveInterest
+) external onlyExpansionController whenNotPaused returns (uint256 amountToMint) {
+  PoolExchange memory exchange = getPoolExchange(exchangeId);
+
+  uint256 reserveinterestScaled = reserveInterest * tokenPrecisionMultipliers[exchange.reserveAsset];
+  uint256 amountToMintScaled = unwrap(
+    wrap(reserveinterestScaled).mul(wrap(exchange.tokenSupply)).div(wrap(exchange.reserveBalance))
+  );
+  amountToMint = amountToMintScaled / tokenPrecisionMultipliers[exchange.tokenAddress];
+
+  exchanges[exchangeId].tokenSupply += amountToMintScaled;
+  exchanges[exchangeId].reserveBalance += reserveinterestScaled;
+
+  return amountToMint;
+}
+```
+
+### Mitigation
+
+Revert if the `amountToMint` from the `GoodDollarExchangeProvider::mintFromInterest()` call is null. The same should also be done for `GoodDollarExpansionController::mintUBIFromExpansion()` `amountMinted` from the `GoodDollarExchangeProvider.mintFromExpansion()` call.
+
+# Issue M-4: `TradingLimits::update()` incorrectly only rounds up when `deltaFlowUnits` becomes 0, which will silently increase trading limits 
 
 Source: https://github.com/sherlock-audit/2024-10-mento-update-judging/issues/45 
 
@@ -66,7 +232,7 @@ Source: https://github.com/sherlock-audit/2024-10-mento-update-judging/issues/45
 0x73696d616f
 ### Summary
 
-[TradingLimits::update()](https://github.com/sherlock-audit/2024-10-mento-update/blob/main/mento-core/contracts/libraries/TradingLimits.sol#L124) divides the traded funds by the decimals of the token, `int256 _deltaFlowUnits = _deltaFlow / int256((10 ** uint256(decimals)));`. In a token with 18 decimals, for example, swapping 1.999...e18 tokens will lead to a `_deltaFlowUnits` of just `1`, taking a major error. This can be exploited to swap up to twice the trading limit, if tokens are swapped 2 by 2 and the state is updated only by 1 each time. Overall, even without malicious intent, the limits will always be silently bypassed due to the rounding.
+[TradingLimits::update()](https://github.com/sherlock-audit/2024-10-mento-update/blob/main/mento-core/contracts/libraries/TradingLimits.sol#L124) divides the traded funds by the decimals of the token, int256 _deltaFlowUnits = _deltaFlow / int256((10 ** uint256(decimals)));`. In a token with 18 decimals, for example, swapping 1.999...e18 tokens will lead to a `_deltaFlowUnits` of just `1`, taking a major error. This can be exploited to swap up to twice the trading limit, if tokens are swapped 2 by 2 and the state is updated only by 1 each time. Overall, even without malicious intent, the limits will always be bypassed due to the rounding.
 
 ### Root Cause
 
@@ -115,12 +281,12 @@ The correct fix is:
 int256 _deltaFlowUnits = (_deltaFlow - 1) / int256((10 ** uint256(decimals))) + 1;
 ```
 
-# Issue M-3: _getReserveRatioScalar() will give a lesser value than expected 
+# Issue M-5: _getReserveRatioScalar() will give a lesser value than expected 
 
 Source: https://github.com/sherlock-audit/2024-10-mento-update-judging/issues/50 
 
 ## Found by 
-0x73696d616f, 0xc0ffEE, Ollam, Robert, onthehunt, zarkk01
+0x73696d616f, 0xc0ffEE, Ollam, Robert, onthehunt
 ### Summary
 
 [numberOfExpansions = (block.timestamp - config.lastExpansion) / config.expansionFrequency](https://github.com/sherlock-audit/2024-10-mento-update/blob/main/mento-core/contracts/goodDollar/GoodDollarExpansionController.sol#L232)
@@ -164,101 +330,4 @@ _No response_
 ### Mitigation
 
 _No response_
-
-# Issue M-4: Calling `GoodDollarExpansionController::mintUBIFromExpansion()` when the `tokenSupply` is low will mint little $G and still increase the reserve ratio 
-
-Source: https://github.com/sherlock-audit/2024-10-mento-update-judging/issues/70 
-
-## Found by 
-0x73696d616f
-### Summary
-
-[GoodDollarExpansionController::mintUBIFromExpansion()](https://github.com/sherlock-audit/2024-10-mento-update/blob/main/mento-core/contracts/goodDollar/GoodDollarExpansionController.sol#L170) is called every `config.expansionFrequency` seconds to mint $G. The amount to mint is based on the formula:
-`amountToMint = (tokenSupply * reserveRatio - tokenSupply * newRatio) / newRatio`, which scales linearly to `totalSupply`.
-As there is no constraint in the amount that is minted, it may be called when the `tokenSupply` is really low and yield no results.
-For example, a malicious user may take a flashloan, swap a huge amount of token supply out of the system decreasing `tokenSupply`, call `GoodDollarExpansionController::mintUBIFromExpansion()` and then repay the flashloan, minting a much lower amount of $G.
-Even without malicious intent, in times of higher volatility the amount minted may become very low.
-
-In short, due to this issue, it is possible to decrease the reserve ratio significant without expanding the $G supply.
-
-### Root Cause
-
-In `GoodDollarExpansionController:175`, no minimium amounts are enforced. Or the function could be made permissioned by keepers.
-
-### Internal pre-conditions
-
-None.
-
-### External pre-conditions
-
-None.
-
-### Attack Path
-
-The most obvious attack path is the one described in the summary.
-1. Malicious user takes a flash loan of $G.
-2. Then swaps in the `Broker` the $G for reserve, which decreases the token supply as it burns the $G.
-3. Calls `GoodDollarExpansionController::mintUBIFromExpansion()`, which mints a very low amount of token supply.
-4. Repays the flash loan.
-Alternatively, this flow may happen without flashloans or malicious intent in times of higher volatility.
-
-### Impact
-
-The ability to expand $G is compromised and the reserve ratio will keep decreasing.
-
-### PoC
-
-`GoodDollarExpansionController::mintUBIFromExpansion()` enforces no limits or permission on the caller.
-```solidity
-function mintUBIFromExpansion(bytes32 exchangeId) external returns (uint256 amountMinted) {
-  IBancorExchangeProvider.PoolExchange memory exchange = IBancorExchangeProvider(address(goodDollarExchangeProvider))
-    .getPoolExchange(exchangeId);
-  ExchangeExpansionConfig memory config = getExpansionConfig(exchangeId);
-
-  bool shouldExpand = block.timestamp > config.lastExpansion + config.expansionFrequency;
-  if (shouldExpand || config.lastExpansion == 0) {
-    uint256 reserveRatioScalar = _getReserveRatioScalar(config);
-
-    exchangeExpansionConfigs[exchangeId].lastExpansion = uint32(block.timestamp);
-    amountMinted = goodDollarExchangeProvider.mintFromExpansion(exchangeId, reserveRatioScalar);
-
-    IGoodDollar(exchange.tokenAddress).mint(address(distributionHelper), amountMinted);
-    distributionHelper.onDistribution(amountMinted);
-
-    // Ignored, because contracts only interacts with trusted contracts and tokens
-    // slither-disable-next-line reentrancy-events
-    emit ExpansionUBIMinted(exchangeId, amountMinted);
-  }
-}
-```
-`GoodDollarExchangeProvider::mintFromExpansion()` formula scales pro-rata to `tokenSupply`:
-```solidity
-   * @dev Calculates the amount of G$ tokens that need to be minted as a result of the expansion
-   *      while keeping the current price the same.
-   *      calculation: amountToMint = (tokenSupply * reserveRatio - tokenSupply * newRatio) / newRatio
-   */
-  function mintFromExpansion(
-  ...
-```
-
-`BancorExchangeProvider::executeSwap()` decreases the total supply when `tokenIn != exchange.reserveAsset`. Or, in other words, by transferring in $G it decreases `exchange.tokenSupply`:
-```solidity
-function executeSwap(bytes32 exchangeId, address tokenIn, uint256 scaledAmountIn, uint256 scaledAmountOut) internal {
-  PoolExchange memory exchange = getPoolExchange(exchangeId);
-  if (tokenIn == exchange.reserveAsset) {
-    exchange.reserveBalance += scaledAmountIn;
-    exchange.tokenSupply += scaledAmountOut;
-  } else {
-    require(exchange.reserveBalance >= scaledAmountOut, "Insufficient reserve balance for swap");
-    exchange.reserveBalance -= scaledAmountOut;
-    exchange.tokenSupply -= scaledAmountIn;
-  }
-  exchanges[exchangeId].reserveBalance = exchange.reserveBalance;
-  exchanges[exchangeId].tokenSupply = exchange.tokenSupply;
-}
-```
-
-### Mitigation
-
-Specify minimum amounts of $G to mint for every expansion or make the function permissioned.
 
