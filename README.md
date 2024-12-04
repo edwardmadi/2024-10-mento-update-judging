@@ -2,6 +2,8 @@
 
 Source: https://github.com/sherlock-audit/2024-10-mento-update-judging/issues/17 
 
+The protocol has acknowledged this issue.
+
 ## Found by 
 0x73696d616f
 ### Summary
@@ -130,9 +132,21 @@ function mintFromExpansion(
 }
 ```
 
+
+
+## Discussion
+
+**sherlock-admin2**
+
+The protocol team fixed this issue in the following PRs/commits:
+https://github.com/mento-protocol/mento-core/pull/548
+
+
 # Issue M-3: Malicious user may frontrun `GoodDollarExpansionController::mintUBIFromReserveBalance()` to make protocol funds stuck 
 
 Source: https://github.com/sherlock-audit/2024-10-mento-update-judging/issues/33 
+
+The protocol has acknowledged this issue.
 
 ## Found by 
 0x73696d616f
@@ -227,6 +241,8 @@ Revert if the `amountToMint` from the `GoodDollarExchangeProvider::mintFromInter
 # Issue M-4: `TradingLimits::update()` incorrectly only rounds up when `deltaFlowUnits` becomes 0, which will silently increase trading limits 
 
 Source: https://github.com/sherlock-audit/2024-10-mento-update-judging/issues/45 
+
+The protocol has acknowledged this issue.
 
 ## Found by 
 0x73696d616f
@@ -330,4 +346,14 @@ _No response_
 ### Mitigation
 
 _No response_
+
+
+
+## Discussion
+
+**sherlock-admin2**
+
+The protocol team fixed this issue in the following PRs/commits:
+https://github.com/mento-protocol/mento-core/pull/553
+
 
